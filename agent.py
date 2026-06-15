@@ -18,7 +18,55 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
+import re
+
 from tools import search_listings, suggest_outfit, create_fit_card
+
+
+# ── query parsing ─────────────────────────────────────────────────────────────
+
+# Size tokens, ordered longest-first so "S/M" wins over "S", "XXL" over "XL".
+_SIZE_RE = re.compile(
+    r"\bsize\s+(\d+(?:\.\d+)?)\b"               # "size 8", "size 8.5"
+    r"|\b(?:size\s+)?(XXL|XXS|S/M|M/L|XL|XS|S|M|L)\b",
+    re.IGNORECASE,
+)
+# "$30" / "under $30" (optional 'under'), or "under 30" (no dollar sign).
+_PRICE_RE = re.compile(
+    r"(?:under\s+)?\$\s*(\d+(?:\.\d+)?)\b|\bunder\s+(\d+(?:\.\d+)?)\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_query(query: str) -> dict:
+    """Extract description, size, and max_price from a query using regex."""
+    price_match = _PRICE_RE.search(query)
+    size_match = _SIZE_RE.search(query)
+
+    max_price = None
+    if price_match:
+        value = price_match.group(1) or price_match.group(2)
+        max_price = float(value)
+
+    size = None
+    if size_match:
+        size = (size_match.group(1) or size_match.group(2)).upper()
+
+    # Build the description by cutting the price and size spans out of the
+    # original query, then cleaning up leftover commas and whitespace.
+    description = query
+    spans = []
+    if price_match:
+        spans.append(price_match.span())
+    if size_match:
+        spans.append(size_match.span())
+    for start, end in sorted(spans, reverse=True):
+        description = description[:start] + " " + description[end:]
+
+    description = re.sub(r"\s*,\s*", " ", description)   # drop stray commas
+    description = re.sub(r"\s+", " ", description).strip()
+
+    return {"description": description, "size": size, "max_price": max_price}
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -92,9 +140,46 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
+    # Step 1: fresh session.
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 2: parse the query (regex, no LLM).
+    parsed = _parse_query(query)
+    session["parsed"] = parsed
+    description = parsed["description"]
+    size = parsed["size"]
+    max_price = parsed["max_price"]
+
+    # Step 3: search. Hard stop if nothing matches.
+    results = search_listings(description, size, max_price)
+    session["search_results"] = results
+    if results == []:
+        filters = []
+        if size:
+            filters.append(f"size {size}")
+        if max_price is not None:
+            filters.append(f"under ${max_price:g}")
+        filter_text = f" with filters ({', '.join(filters)})" if filters else ""
+        session["error"] = (
+            f"No listings found for '{description}'{filter_text}. "
+            "Try broader keywords or removing a filter."
+        )
+        return session
+
+    # Step 4: select the top-ranked item.
+    session["selected_item"] = results[0]
+
+    # Step 5: outfit suggestion. Stop early if it comes back empty.
+    outfit = suggest_outfit(session["selected_item"], session["wardrobe"])
+    session["outfit_suggestion"] = outfit
+    if not outfit or not outfit.strip():
+        session["error"] = "Outfit suggestion returned empty."
+        return session
+
+    # Step 6: fit card.
+    session["fit_card"] = create_fit_card(outfit, session["selected_item"])
+
+    # Step 7: done.
     return session
 
 
